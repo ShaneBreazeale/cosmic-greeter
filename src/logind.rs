@@ -104,6 +104,10 @@ pub async fn handler(msg_tx: &mut mpsc::Sender<Message>) -> Result<(), Box<dyn E
     let mut interval = tokio::time::interval(Duration::from_secs(1));
 
     loop {
+        // Skip the rate limit after going to sleep: the interval's monotonic clock
+        // does not advance while suspended, so it would delay the resume signal
+        let mut skip_tick = false;
+
         // Waits until a signal has been received
         tokio::select!(
             signal_opt = prepare_for_sleep.next() => {
@@ -112,10 +116,12 @@ pub async fn handler(msg_tx: &mut mpsc::Sender<Message>) -> Result<(), Box<dyn E
                         Ok(args) => {
                             if args.start {
                                 tracing::info!("logind prepare for sleep");
+                                msg_tx.send(Message::Sleep(true)).await?;
                                 if let Some(inhibit) = inhibit_opt.take() {
                                     msg_tx.send(Message::Inhibit(Arc::new(inhibit))).await?;
                                 }
                                 msg_tx.send(Message::Lock).await?;
+                                skip_tick = true;
                             } else {
                                 tracing::info!("logind resume");
                                 if inhibit_opt.is_none() {
@@ -123,6 +129,7 @@ pub async fn handler(msg_tx: &mut mpsc::Sender<Message>) -> Result<(), Box<dyn E
                                 }
                                 // Immediately update time when resuming from sleep.
                                 msg_tx.send(Message::Common(common::Message::Tick)).await?;
+                                msg_tx.send(Message::Sleep(false)).await?;
                             }
                         },
                         Err(err) => {
@@ -142,6 +149,8 @@ pub async fn handler(msg_tx: &mut mpsc::Sender<Message>) -> Result<(), Box<dyn E
             msg_tx.send(Message::Unlock).await?;
         });
 
-        interval.tick().await;
+        if !skip_tick {
+            interval.tick().await;
+        }
     }
 }

@@ -1,0 +1,7 @@
+#%PAM-1.0
+# Lock screen fingerprint, run in parallel with cosmic-greeter-password. The
+# locker restarts it after each timeout. Only auth and account are used.
+auth    requisite       pam_nologin.so
+auth    required        pam_succeed_if.so user != root quiet_success
+auth    required        pam_fprintd.so max-tries=3 timeout=10
+@include common-account

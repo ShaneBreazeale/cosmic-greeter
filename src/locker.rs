@@ -126,11 +126,35 @@ fn pam_error_to_message(error: &pam_client::Error) -> String {
     }
 }
 
-pub fn pam_thread(username: String, conversation: Conversation) -> Result<(), pam_client::Error> {
+/// PAM service used for password and fingerprint together (stock behavior)
+const PAM_SERVICE: &str = "cosmic-greeter";
+/// Password-only PAM service, used when fingerprint runs alongside it
+const PAM_SERVICE_PASSWORD: &str = "cosmic-greeter-password";
+/// Fingerprint-only PAM service, run in parallel with the password one
+const PAM_SERVICE_FINGERPRINT: &str = "cosmic-greeter-fingerprint";
+
+/// Run fingerprint and password side by side if both split PAM services exist
+fn split_pam_available() -> bool {
+    [PAM_SERVICE_PASSWORD, PAM_SERVICE_FINGERPRINT]
+        .iter()
+        .all(|service| std::path::Path::new("/etc/pam.d").join(service).exists())
+}
+
+/// Set while the system sleeps, so the fingerprint loop leaves the reader alone
+static SLEEPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Give up on fingerprint for this lock after this many rounds of failed matches
+const FINGERPRINT_MAX_ROUNDS: u32 = 2;
+
+pub fn pam_thread<C: pam_client::ConversationHandler>(
+    username: String,
+    service: &str,
+    conversation: C,
+) -> Result<(), pam_client::Error> {
     //TODO: send errors to GUI, restart process
 
     // Create PAM context
-    let mut context = pam_client::Context::new("cosmic-greeter", Some(&username), conversation)?;
+    let mut context = pam_client::Context::new(service, Some(&username), conversation)?;
 
     // Authenticate the user (ask for password, 2nd-factor token, fingerprint, etc.)
     tracing::info!("authenticate");
@@ -248,6 +272,42 @@ impl pam_client::ConversationHandler for Conversation {
     }
 }
 
+/// Conversation for the fingerprint-only PAM service: its messages go to a status
+/// line, and it never asks for input.
+pub struct FingerprintConversation {
+    msg_tx: futures::channel::mpsc::Sender<cosmic::Action<Message>>,
+}
+
+impl FingerprintConversation {
+    fn status(&mut self, prompt_c: &CStr) {
+        let status = prompt_c.to_string_lossy().into_owned();
+        if let Err(err) = futures::executor::block_on(self.msg_tx.send(cosmic::Action::App(
+            Message::FingerprintStatus(Some(status)),
+        ))) {
+            tracing::warn!("failed to send fingerprint status: {:?}", err);
+        }
+    }
+}
+
+impl pam_client::ConversationHandler for FingerprintConversation {
+    fn prompt_echo_on(&mut self, prompt_c: &CStr) -> Result<CString, pam_client::ErrorCode> {
+        tracing::warn!("fingerprint service asked for input {:?}", prompt_c);
+        Err(pam_client::ErrorCode::CONV_ERR)
+    }
+    fn prompt_echo_off(&mut self, prompt_c: &CStr) -> Result<CString, pam_client::ErrorCode> {
+        tracing::warn!("fingerprint service asked for input {:?}", prompt_c);
+        Err(pam_client::ErrorCode::CONV_ERR)
+    }
+    fn text_info(&mut self, prompt_c: &CStr) {
+        tracing::info!("fingerprint text_info {:?}", prompt_c);
+        self.status(prompt_c);
+    }
+    fn error_msg(&mut self, prompt_c: &CStr) {
+        tracing::info!("fingerprint error_msg {:?}", prompt_c);
+        self.status(prompt_c);
+    }
+}
+
 #[derive(Clone)]
 pub struct Flags {
     user_data: UserData,
@@ -281,6 +341,10 @@ pub enum Message {
     Error(String),
     Lock,
     Unlock,
+    /// System going to sleep (true) or resumed (false), from logind
+    Sleep(bool),
+    /// Status line from the parallel fingerprint conversation
+    FingerprintStatus(Option<String>),
 }
 
 impl From<common::Message> for Message {
@@ -318,6 +382,7 @@ pub struct App {
     inhibit_opt: Option<Arc<OwnedFd>>,
     value_tx_opt: Option<mpsc::Sender<String>>,
     authenticating: bool,
+    fingerprint_status: Option<String>,
 }
 
 impl App {
@@ -617,6 +682,10 @@ impl App {
                 column = column.push(widget::text(""));
             }
 
+            if let Some(status) = &self.fingerprint_status {
+                column = column.push(widget::text(status));
+            }
+
             widget::container(column)
                 .align_x(Alignment::Center)
                 .width(Length::Fill)
@@ -707,6 +776,7 @@ impl cosmic::Application for App {
             inhibit_opt: None,
             value_tx_opt: None,
             authenticating: false,
+            fingerprint_status: None,
         };
 
         let task = if cfg!(feature = "logind") && app.flags.logind_available {
@@ -911,10 +981,13 @@ impl cosmic::Application for App {
                     }
 
                     let username = self.flags.user_data.name.clone();
+                    let split_pam = split_pam_available();
+                    tracing::info!("parallel fingerprint authentication: {}", split_pam);
+                    self.fingerprint_status = None;
                     let (locked_task, locked_handle) =
                         cosmic::task::stream(cosmic::iced::stream::channel(
                             16,
-                            |mut msg_tx: futures::channel::mpsc::Sender<_>| async move {
+                            move |mut msg_tx: futures::channel::mpsc::Sender<_>| async move {
                                 // Send heartbeat once a second to update time.
                                 let heartbeat_future = {
                                     let mut output = msg_tx.clone();
@@ -933,6 +1006,9 @@ impl cosmic::Application for App {
                                     }
                                 };
 
+                                let fingerprint_tx = msg_tx.clone();
+                                let fingerprint_username = username.clone();
+
                                 let pam_future = async {
                                     loop {
                                         let (value_tx, value_rx) = mpsc::channel(16);
@@ -947,6 +1023,11 @@ impl cosmic::Application for App {
                                             task::spawn_blocking(move || {
                                                 pam_thread(
                                                     username,
+                                                    if split_pam {
+                                                        PAM_SERVICE_PASSWORD
+                                                    } else {
+                                                        PAM_SERVICE
+                                                    },
                                                     Conversation { msg_tx, value_rx },
                                                 )
                                             })
@@ -976,9 +1057,97 @@ impl cosmic::Application for App {
                                     }
                                 };
 
+                                // Fingerprint runs in its own PAM conversation so it keeps
+                                // listening while a password is typed, and is simply
+                                // restarted when it times out or the reader goes away.
+                                let fingerprint_future = {
+                                    let mut msg_tx = fingerprint_tx;
+                                    let username = fingerprint_username;
+                                    async move {
+                                        if !split_pam {
+                                            return std::future::pending::<()>().await;
+                                        }
+                                        let mut quick_failures = 0u32;
+                                        let mut failed_rounds = 0u32;
+                                        loop {
+                                            while SLEEPING.load(std::sync::atomic::Ordering::SeqCst)
+                                            {
+                                                tokio::time::sleep(Duration::from_millis(100))
+                                                    .await;
+                                            }
+
+                                            let started = std::time::Instant::now();
+                                            let res = {
+                                                let username = username.clone();
+                                                let msg_tx = msg_tx.clone();
+                                                task::spawn_blocking(move || {
+                                                    pam_thread(
+                                                        username,
+                                                        PAM_SERVICE_FINGERPRINT,
+                                                        FingerprintConversation { msg_tx },
+                                                    )
+                                                })
+                                                .await
+                                                .unwrap()
+                                            };
+
+                                            let err = match res {
+                                                Ok(()) => {
+                                                    tracing::info!("fingerprint authenticated");
+                                                    msg_tx
+                                                        .send(cosmic::Action::App(Message::Unlock))
+                                                        .await
+                                                        .unwrap();
+                                                    return;
+                                                }
+                                                Err(err) => err,
+                                            };
+                                            tracing::info!("fingerprint attempt ended: {}", err);
+
+                                            if err.code() == pam_client::ErrorCode::MAXTRIES {
+                                                failed_rounds += 1;
+                                                if failed_rounds >= FINGERPRINT_MAX_ROUNDS {
+                                                    tracing::warn!("too many fingerprint failures");
+                                                    msg_tx
+                                                        .send(cosmic::Action::App(
+                                                            Message::FingerprintStatus(Some(
+                                                                pam_error_to_message(&err),
+                                                            )),
+                                                        ))
+                                                        .await
+                                                        .unwrap();
+                                                    return std::future::pending::<()>().await;
+                                                }
+                                            }
+
+                                            if SLEEPING.load(std::sync::atomic::Ordering::SeqCst) {
+                                                // Ended by the sleep hook stopping fprintd
+                                                quick_failures = 0;
+                                                continue;
+                                            }
+
+                                            // No reader yet, or still claimed: back off
+                                            if started.elapsed() < Duration::from_secs(2) {
+                                                quick_failures += 1;
+                                                let backoff = Duration::from_millis(
+                                                    300 << (quick_failures - 1).min(4),
+                                                );
+                                                tokio::time::sleep(backoff).await;
+                                            } else {
+                                                quick_failures = 0;
+                                            }
+                                        }
+                                    }
+                                };
+
                                 futures::pin_mut!(heartbeat_future);
                                 futures::pin_mut!(pam_future);
-                                futures::future::select(heartbeat_future, pam_future).await;
+                                futures::pin_mut!(fingerprint_future);
+                                futures::future::select(
+                                    heartbeat_future,
+                                    futures::future::select(pam_future, fingerprint_future),
+                                )
+                                .await;
                             },
                         ))
                         .abortable();
@@ -1132,6 +1301,14 @@ impl cosmic::Application for App {
             }
             Message::TimeAppletConfig(config) => {
                 self.flags.user_data.time_applet_config = config;
+            }
+            Message::Sleep(sleeping) => {
+                SLEEPING.store(sleeping, std::sync::atomic::Ordering::SeqCst);
+            }
+            Message::FingerprintStatus(status) => {
+                if matches!(self.state, State::Locked { .. }) {
+                    self.fingerprint_status = status;
+                }
             }
             Message::Error(error) => {
                 self.common.error_opt = Some(error);
